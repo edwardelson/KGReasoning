@@ -7,3 +7,7 @@ data/
 *.pdf
 *.eps
 submission/
+
+.ipynb_checkpoints/
+
+checkpoint/
