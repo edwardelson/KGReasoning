@@ -20,6 +20,28 @@ import time
 from tqdm import tqdm
 import os
 
+eps = 1e-6
+
+# ensure lower < upper truth bound for logic embedding
+def order_bounds(embedding):
+    embedding = torch.clamp(embedding, 0, 1)
+    lower, upper = torch.chunk(embedding, 2, dim=-1)
+    contra = lower > upper
+    if contra.any(): # if there's any contradiction
+        mean = (lower + upper) / 2
+        lower = torch.where(lower > upper, mean, lower)
+        upper = torch.where(lower > upper, mean, upper)
+    ordered_embedding = torch.cat([lower, upper], dim=-1)
+    return ordered_embedding
+
+# ReLU with gradient-transparent clamp on negative
+def valclamp(x, a=1, b=7, lo=0, hi=1):
+    elu_neg = a * (torch.exp(b * x) - 1)
+    return ((x < lo).float() * (lo + elu_neg - elu_neg.detach()) + 
+            (lo <= x).float() * (x <= hi).float() * x +
+            (hi < x).float())
+
+
 def Identity(x):
     return x
 
@@ -105,6 +127,106 @@ class BetaProjection(nn.Module):
 
         return x
 
+    
+class LogicIntersection(nn.Module):
+    def __init__(self, dim, tnorm, bounded, use_att, use_gtrans):
+        super(LogicIntersection, self).__init__()
+        self.dim = dim
+        self.tnorm = tnorm
+        self.bounded = bounded
+        self.use_att = use_att
+        self.use_gtrans = use_gtrans
+        
+        # if attention is used
+        if use_att:
+            self.layer1 = nn.Linear(2 * self.dim, 2 * self.dim)
+            if bounded:
+                self.layer2 = nn.Linear(2 * self.dim, self.dim)
+            else:
+                self.layer2 = nn.Linear(2 * self.dim, 2*self.dim)
+            
+            nn.init.xavier_uniform_(self.layer1.weight)
+            nn.init.xavier_uniform_(self.layer2.weight)
+    
+    def forward(self, embeddings):
+        # if attention is used
+        if self.use_att:
+            layer1_act = F.relu(self.layer1(embeddings))
+            attention = F.softmax(self.layer2(layer1_act), dim=0)
+            attention = attention / torch.max(attention, dim=0, keepdim=True).values
+            
+            if self.bounded:
+                attention = torch.cat([attention, attention], dim=-1)
+                
+            if self.tnorm == "mins":
+                smooth_param = -10
+                min_weights = attention * torch.exp(smooth_param * embeddings)
+                embedding = torch.sum(min_weights * embeddings, dim=0) / torch.sum(min_weights, dim=0)
+                if self.bounded:
+                    embedding = order_bounds(embedding)
+                    
+            elif self.tnorm == "luk":
+                embedding = 1 - torch.sum(attention * (1 - embeddings), dim=0)
+                if self.use_gtrans:
+                    embedding = valclamp(embedding, b=6./embedding.shape[0])
+                else:
+                    embedding = torch.clamp(embedding, 0, 1)
+                    
+            elif self.tnorm == "prod":
+                embedding = torch.prod(torch.pow(torch.clamp(embeddings, 0, 1) + eps, attention), dim=0)
+         # if no attention      
+        else:
+            if self.tnorm == "mins":
+                smooth_param = -10
+                min_weights = torch.exp(smooth_param * embeddings)
+                embedding = torch.sum(min_weights * embeddings, dim=0) / torch.sum(min_weights, dim=0)
+                if self.bounded:
+                    embedding = order_bounds(embedding)
+                    
+            elif self.tnorm == "luk":
+                embedding = 1 - torch.sum(1 - embeddings, dim=0)
+                if self.use_gtrans:
+                    embedding = valclamp(embedding, b=6./embedding.shape[0])
+                else:
+                    embedding = torch.clamp(embedding, 0, 1)
+                    
+            elif self.tnorm == "prod":
+                embedding = torch.prod(embeddings, dim=0)
+                
+        return embedding
+    
+    
+class LogicProjection(nn.Module):
+    def __init__(self, entity_dim, relation_dim, hidden_dim, num_layers, bounded):
+        super(LogicProjection, self).__init__()
+        self.entity_dim = entity_dim
+        self.relation_dim = relation_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.bounded = bounded
+        self.layer1 = nn.Linear(self.entity_dim + self.relation_dim, self.hidden_dim)
+        self.layer0 = nn.Linear(self.hidden_dim, self.entity_dim) # final layer
+        for nl in range(2, num_layers + 1):
+            setattr(self, "layer{}".format(nl), nn.Linear(self.hidden_dim, self.hidden_dim))
+        for nl in range(num_layers + 1):
+            nn.init.xavier_uniform_(getattr(self, "layer{}".format(nl)).weight)
+            
+    def forward(self, e_embedding, r_embedding):
+        x = torch.cat([e_embedding, r_embedding], dim=-1)
+        for nl in range(1, self.num_layers + 1):
+            x = F.relu(getattr(self, "layer{}".format(nl))(x))
+        x = self.layer0(x)
+        x = torch.sigmoid(x)
+        
+        if self.bounded:
+            lower, upper = torch.chunk(x, 2, dim=-1)
+            upper = lower + upper * (1 - lower)
+            x = torch.cat([lower, upper], dim=-1)
+            
+        return x
+    
+    
+            
 class Regularizer():
     def __init__(self, base_add, min_val, max_val):
         self.base_add = base_add
@@ -118,7 +240,7 @@ class KGReasoning(nn.Module):
     def __init__(self, nentity, nrelation, hidden_dim, gamma, 
                  geo, test_batch_size=1,
                  box_mode=None, use_cuda=False,
-                 query_name_dict=None, beta_mode=None):
+                 query_name_dict=None, beta_mode=None, logic_mode=None):
         super(KGReasoning, self).__init__()
         self.nentity = nentity
         self.nrelation = nrelation
@@ -158,6 +280,15 @@ class KGReasoning(nn.Module):
             self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim * 2)) # alpha and beta
             self.entity_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings are positive
             self.projection_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings after relation projection are positive
+        elif self.geo == 'logic':
+            self.tnorm, self.bounded, use_att, use_gtrans, hidden_dim, num_layers = logic_mode
+            if self.bounded:
+                lower = torch.rand((nentity, self.entity_dim))
+                upper = lower + torch.rand((nentity, self.entity_dim)) * (1 - lower)
+                self.entity_embedding = nn.Parameter(torch.cat([lower, upper], dim=-1))
+            else:
+                self.entity_embedding = nn.Parameter(torch.rand((nentity, self.entity_dim * 2)))
+            
         nn.init.uniform_(
             tensor=self.entity_embedding, 
             a=-self.embedding_range.item(), 
@@ -190,6 +321,11 @@ class KGReasoning(nn.Module):
                                              hidden_dim, 
                                              self.projection_regularizer, 
                                              num_layers)
+        elif self.geo == "logic":
+            self.tnorm, self.bounded, use_att, use_gtrans, hidden_dim, num_layers = logic_mode
+            self.center_net = LogicIntersection(self.entity_dim, self.tnorm, self.bounded, use_att, use_gtrans)
+            self.projection_net = LogicProjection(self.entity_dim * 2, self.relation_dim, hidden_dim, num_layers, self.bounded)
+
 
     def forward(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
         if self.geo == 'box':
@@ -198,6 +334,8 @@ class KGReasoning(nn.Module):
             return self.forward_vec(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
         elif self.geo == 'beta':
             return self.forward_beta(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+        elif self.geo == "logic":
+            return self.forward_logic(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
 
     def embed_query_box(self, queries, query_structure, idx):
         '''
@@ -309,6 +447,61 @@ class KGReasoning(nn.Module):
 
         return alpha_embedding, beta_embedding, idx
 
+   
+    def embed_query_logic(self, queries, query_structure, idx):
+        '''
+        Iterative embed a batch of queries with same structure using GQE
+        queries: a flattened batch of queries
+        '''
+        all_relation_flag = True
+        for ele in query_structure[-1]: # whether the current query tree has merged to one branch and only need to do relation traversal, e.g., path queries or conjunctive queries after the intersection
+            if ele not in ['r', 'n']:
+                all_relation_flag = False
+                break
+        if all_relation_flag:
+            if query_structure[0] == 'e':
+                embedding = torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx])
+                idx += 1
+            else:
+                embedding, idx = self.embed_query_logic(queries, query_structure[0], idx)
+            for i in range(len(query_structure[-1])):
+                if query_structure[-1][i] == 'n':
+                    assert (queries[:, idx] == -2).all()
+                    if self.bounded:
+                        lower_embedding, upper_embedding = torch.chunk(embedding, 2, dim=-1)
+                        embedding = torch.cat([1 - upper_embedding, 1 - lower_embedding], dim=-1)
+                    else:
+                        embedding = 1 - embedding
+                else:
+                    r_embedding = torch.index_select(self.relation_embedding, dim=0, index=queries[:, idx])
+                    embedding = self.projection_net(embedding, r_embedding)
+                idx += 1
+        else:
+            embedding_list = []
+            for i in range(len(query_structure)):
+                embedding, idx = self.embed_query_logic(queries, query_structure[i], idx)
+                embedding_list.append(embedding)
+            embedding = self.center_net(torch.stack(embedding_list))
+
+        return embedding, idx
+
+    
+    def cal_logit_logic(self, entity_embedding, query_embedding):
+        if self.bounded:
+            lower_embedding, upper_embedding = torch.chunk(entity_embedding, 2, dim=-1)
+            query_lower_embedding, query_upper_embedding = torch.chunk(query_embedding, 2, dim=-1)
+            
+            lower_dist = torch.norm(lower_embedding - query_lower_embedding, p=1, dim=-1)
+            upper_dist = torch.norm(query_upper_embedding - upper_embedding, p=1, dim=-1)
+            
+            logit = self.gamma - (lower_dist + upper_dist) / 2 / lower_embedding.shape[-1]
+        else:
+            logit = self.gamma - torch.norm(entity_embedding - query_embedding, p=1, dim=-1) / query_embedding.shape[-1]
+            
+        logit *= 100
+        
+        return logit
+    
     def cal_logit_beta(self, entity_embedding, query_dist):
         alpha_embedding, beta_embedding = torch.chunk(entity_embedding, 2, dim=-1)
         entity_dist = torch.distributions.beta.Beta(alpha_embedding, beta_embedding)
@@ -392,6 +585,83 @@ class KGReasoning(nn.Module):
 
         return positive_logit, negative_logit, subsampling_weight, all_idxs+all_union_idxs
 
+    def forward_logic(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
+        all_entropy = None
+        all_idxs, all_embeddings = [], []
+        all_union_idxs, all_union_embeddings = [], []
+        for query_structure in batch_queries_dict:
+            if 'u' in self.query_name_dict[query_structure] and 'DNF' in self.query_name_dict[query_structure]:
+                embedding, _ = self.embed_query_logic(self.transform_union_query(batch_queries_dict[query_structure], 
+                                                                    query_structure), 
+                                                                self.transform_union_structure(query_structure), 0)
+                all_union_idxs.extend(batch_idxs_dict[query_structure])
+                all_union_embeddings.append(embedding)
+            else:
+                embedding, _ = self.embed_query_logic(batch_queries_dict[query_structure], query_structure, 0)
+                all_idxs.extend(batch_idxs_dict[query_structure])
+                all_embeddings.append(embedding)
+
+        if len(all_embeddings) > 0:
+            all_embeddings = torch.cat(all_embeddings, dim=0).unsqueeze(1)
+            if positive_sample is None and self.bounded:
+                lower, upper = torch.chunk(all_embeddings, 2, dim=-1)
+                truth_interval = upper - lower
+                distribution = torch.distributions.uniform.Uniform(lower, upper + eps)
+                all_entropy = (distribution.entropy(), truth_interval)
+            
+            
+        if len(all_union_embeddings) > 0:
+            all_union_embeddings = torch.cat(all_union_embeddings, dim=0).unsqueeze(1)
+            all_union_embeddings = all_union_embeddings.view(all_union_embeddings.shape[0]//2, 2, 1, -1)
+
+        if type(subsampling_weight) != type(None):
+            subsampling_weight = subsampling_weight[all_idxs+all_union_idxs]
+
+        if type(positive_sample) != type(None):
+            if len(all_embeddings) > 0:
+                positive_sample_regular = positive_sample[all_idxs]
+                positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_regular).unsqueeze(1)
+                positive_logit = self.cal_logit_logic(positive_embedding, all_embeddings)
+            else:
+                positive_logit = torch.Tensor([]).to(self.entity_embedding.device)
+
+            if len(all_union_embeddings) > 0:
+                positive_sample_union = positive_sample[all_union_idxs]
+                positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_union).unsqueeze(1).unsqueeze(1)
+                positive_union_logit = self.cal_logit_logic(positive_embedding, all_union_embeddings)
+                positive_union_logit = torch.max(positive_union_logit, dim=1)[0]
+            else:
+                positive_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
+            positive_logit = torch.cat([positive_logit, positive_union_logit], dim=0)
+        else:
+            positive_logit = None
+
+        if type(negative_sample) != type(None):
+            if len(all_embeddings) > 0:
+                negative_sample_regular = negative_sample[all_idxs]
+                batch_size, negative_size = negative_sample_regular.shape
+                negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_regular.view(-1)).view(batch_size, negative_size, -1)
+                negative_logit = self.cal_logit_logic(negative_embedding, all_embeddings)
+            else:
+                negative_logit = torch.Tensor([]).to(self.entity_embedding.device)
+
+            if len(all_union_embeddings) > 0:
+                negative_sample_union = negative_sample[all_union_idxs]
+                batch_size, negative_size = negative_sample_union.shape
+                negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_union.view(-1)).view(batch_size, 1, negative_size, -1)
+                negative_union_logit = self.cal_logit_logic(negative_embedding, all_union_embeddings)
+                negative_union_logit = torch.max(negative_union_logit, dim=1)[0]
+            else:
+                negative_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
+            negative_logit = torch.cat([negative_logit, negative_union_logit], dim=0)
+        else:
+            negative_logit = None
+
+        return positive_logit, negative_logit, subsampling_weight, all_idxs+all_union_idxs
+    
+    
+    
+    
     def transform_union_query(self, queries, query_structure):
         '''
         transform 2u queries to two 1p queries
